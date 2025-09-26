@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-API_KEY = os.getenv("GENE_API_KEY", "dev-key")
+API_KEY = os.getenv("44b74162f32d46828aac9cad788e78948ea91d78ad98416ea3ec380ab2fdf090", "dev-key")
 DEBT_HIGH = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))
 
 AUTO_ESCALATE = {
