@@ -38,16 +38,16 @@ def _build_response(text: str, name: str):
             "notes": "Auto-escalate keyword present",
             "escalation": {
                 "summary": "Sensitive keyword detected (billing/legal/etc.)",
-                "suggested": f"Hi {name}, I’m looping a specialist in now. What’s the best number/time today?"
+                "suggested": f"Hi {name}, I'm looping a specialist in now. What's the best number/time today?"
             },
             "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
     # 2) default = clarify to qualify (your main flow)
     return {
         "action": "reply",
-        "reply_text": ("Thanks for the note. Quick check: how much does the IRS say you owe, and do you have any missing tax years that need to be filed? - Gene, Lexington Tax Group"
-) 
-
+        "reply_text": (
+            "Thanks for the note. Quick check: how much does the IRS say you owe, "
+            "and do you have any missing tax years that need to be filed? - Gene, Lexington Tax Group"
         ),
         "notes": "primary_clarify",
         "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
