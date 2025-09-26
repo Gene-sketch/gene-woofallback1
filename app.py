@@ -45,7 +45,8 @@ def _build_response(text: str, name: str):
     # 2) default = clarify to qualify (your main flow)
     return {
         "action": "reply",
-        "reply_text": ("Thanks for the note. Quick check: about how much does the IRS say you owe — over or under $8,000? (You can reply 'over' or 'under'.) - Gene, Lexington Tax Group"
+        "reply_text": ("Thanks for the note. Quick check: how much does the IRS say you owe, and do you have any missing tax years that need to be filed? - Gene, Lexington Tax Group"
+) 
 
         ),
         "notes": "primary_clarify",
