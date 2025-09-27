@@ -4,9 +4,12 @@ from typing import Optional
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-API_KEY = os.getenv("GENE_API_KEY", "dev-key")
-DEBT_HIGH = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))        # qualify at/above this
-SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))   # ask missing years if under this
+# --- Tunable thresholds via env vars ---
+API_KEY       = os.getenv("GENE_API_KEY", "dev-key")
+DEBT_HIGH     = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))   # auto-qualify at/above
+SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask missing years if under
+MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # if amount in [MID_APPT_LOW, MID_APPT_HIGH] AND unfiled -> qualify
+MID_APPT_HIGH = int(os.getenv("MID_APPT_HIGH", "7000"))
 
 AUTO_ESCALATE = {
     "chargeback","refund","billing","attorney","lawyer",
@@ -35,6 +38,22 @@ def parse_amount(text: str) -> Optional[int]:
         num *= 1000
     return num
 
+def detect_unfiled(text: str) -> bool:
+    """
+    Detect phrases that suggest missing/unfiled tax years.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    patterns = [
+        r"\bunfiled\b",
+        r"\bmissing\s+(?:tax\s+)?years?\b",
+        r"\b(not|haven'?t|didn'?t)\s+filed?\b",
+        r"\bbehind\s+on\s+filing\b",
+        r"\bback\s+(?:returns?|years?)\b"
+    ]
+    return any(re.search(p, t) for p in patterns)
+
 @app.get("/")
 async def health():
     return {"ok": True, "service": "gene-woofallback"}
@@ -47,7 +66,7 @@ async def _parse(req: Request):
     return text, name
 
 def _build_response(text: str, name: str):
-    # 1) auto-escalate for sensitive topics
+    # 1) Auto-escalate for sensitive topics
     if has_any(text, AUTO_ESCALATE):
         return {
             "action": "escalate",
@@ -60,47 +79,47 @@ def _build_response(text: str, name: str):
             "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
 
-    # 2) if they mention an amount, auto-decide next step
+    # 2) If they mention an amount, decide next step
     amount = parse_amount(text)
+    unfiled = detect_unfiled(text)
+
     if amount is not None:
+        # A) At/above primary threshold => qualified
         if amount >= DEBT_HIGH:
             return {
                 "action": "qualified",
                 "reply_text": "Great, thanks — I’ll send the booking link now.",
                 "notes": "auto_qualified_by_amount",
-                "qualified": {
-                    "band": "over_threshold",
-                    "amount": amount,
-                    "has_unfiled_years": "unknown",
-                    "state_issue": "unknown"
-                }
+                "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
+
+        # B) Special rule: 5k–7k AND unfiled => qualified
+        if MID_APPT_LOW <= amount <= MID_APPT_HIGH and unfiled:
+            return {
+                "action": "qualified",
+                "reply_text": "Got it — I’ll send the booking link now so we can get a specialist on this.",
+                "notes": "qualified_mid_with_unfiled",
+                "qualified": {"band": "mid_with_unfiled", "amount": amount, "has_unfiled_years": "yes", "state_issue": "unknown"}
+            }
+
+        # C) Under secondary low => ask missing years
         if amount < SECONDARY_LOW:
             return {
                 "action": "reply",
                 "reply_text": "Thanks. Do you have any missing tax years that need to be filed? - Gene, Lexington Tax Group",
                 "notes": "followup_missing_years_under_threshold",
-                "qualified": {
-                    "band": "under_secondary",
-                    "amount": amount,
-                    "has_unfiled_years": "unknown",
-                    "state_issue": "unknown"
-                }
+                "qualified": {"band": "under_secondary", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
-        # mid band
+
+        # D) Mid band without unfiled mention
         return {
             "action": "reply",
             "reply_text": "Thanks for the details. Do you prefer I send a 10-minute booking link, or keep going by text?",
             "notes": "mid_band_next_step",
-            "qualified": {
-                "band": "mid_band",
-                "amount": amount,
-                "has_unfiled_years": "unknown",
-                "state_issue": "unknown"
-            }
+            "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
 
-    # 3) default clarify (your combined question)
+    # 3) Default clarify (combined question)
     return {
         "action": "reply",
         "reply_text": (
