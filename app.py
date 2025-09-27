@@ -11,6 +11,7 @@ SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask missing year
 MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # qualify if 5-7k AND unfiled
 MID_APPT_HIGH = int(os.getenv("MID_APPT_HIGH", "7000"))
 
+# Keywords that should immediately escalate to a human
 AUTO_ESCALATE = {
     "chargeback","refund","billing","attorney","lawyer",
     "levy","lien","garnish","garnishment","lawsuit","complaint","harassment"
@@ -79,25 +80,29 @@ def _build_response(text: str, name: str):
     unfiled = detect_unfiled(text)
 
     if amount is not None:
-        # A) At/above primary threshold => qualified
+        # A) At/above primary threshold => qualified (BOOK)
         if amount >= DEBT_HIGH:
             return {
                 "action": "qualified",
                 "reply_text": "Great, thanks - I'll send the booking link now so we can review options, including IRS Fresh Start savings programs, and check any state issues if that applies.",
                 "notes": "auto_qualified_by_amount",
+                "route": "woo_booking",
+                "handoff": {"to": "woo", "type": "appointment_request", "reason": "over_threshold"},
                 "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
 
-        # B) Special rule: 5-7k AND unfiled => qualified
+        # B) Special rule: 5-7k AND unfiled => qualified (BOOK)
         if MID_APPT_LOW <= amount <= MID_APPT_HIGH and unfiled:
             return {
                 "action": "qualified",
                 "reply_text": "Got it - I'll send the booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
                 "notes": "qualified_mid_with_unfiled",
+                "route": "woo_booking",
+                "handoff": {"to": "woo", "type": "appointment_request", "reason": "mid_with_unfiled"},
                 "qualified": {"band": "mid_with_unfiled", "amount": amount, "has_unfiled_years": "yes", "state_issue": "unknown"}
             }
 
-        # C) Under secondary low => ask missing years
+        # C) Under secondary low => ask missing years (FOLLOW-UP)
         if amount < SECONDARY_LOW:
             return {
                 "action": "reply",
@@ -106,11 +111,13 @@ def _build_response(text: str, name: str):
                 "qualified": {"band": "under_secondary", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
 
-        # D) Mid band without unfiled mention -> nudge to booking (no keep-texting option)
+        # D) Mid band without unfiled mention -> nudge to booking (BOOK)
         return {
             "action": "reply",
             "reply_text": "Thanks for the details - I'll send a quick 10-minute booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
             "notes": "mid_band_send_booking_link",
+            "route": "woo_booking",
+            "handoff": {"to": "woo", "type": "appointment_request", "reason": "mid_band"},
             "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
 
