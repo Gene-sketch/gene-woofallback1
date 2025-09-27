@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 API_KEY       = os.getenv("GENE_API_KEY", "dev-key")
 DEBT_HIGH     = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))   # auto-qualify at/above
 SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask missing years if under
-MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # qualify if 5–7k AND unfiled
+MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # qualify if 5-7k AND unfiled
 MID_APPT_HIGH = int(os.getenv("MID_APPT_HIGH", "7000"))
 
 AUTO_ESCALATE = {
@@ -43,7 +43,7 @@ def detect_unfiled(text: str) -> bool:
     patterns = [
         r"\bunfiled\b",
         r"\bmissing\s+(?:tax\s+)?years?\b",
-        r"\b(not|haven'?t|didn'?t)\s+filed?\b",
+        r"\b(?:not|haven'?t|didn'?t)\s+filed?\b",
         r"\bbehind\s+on\s+filing\b",
         r"\bback\s+(?:returns?|years?)\b"
     ]
@@ -83,16 +83,16 @@ def _build_response(text: str, name: str):
         if amount >= DEBT_HIGH:
             return {
                 "action": "qualified",
-                "reply_text": "Great, thanks — I’ll send the booking link now so we can review options, including IRS Fresh Start savings programs, and check any state issues if that applies.",
+                "reply_text": "Great, thanks - I'll send the booking link now so we can review options, including IRS Fresh Start savings programs, and check any state issues if that applies.",
                 "notes": "auto_qualified_by_amount",
                 "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
 
-        # B) Special rule: 5–7k AND unfiled => qualified
+        # B) Special rule: 5-7k AND unfiled => qualified
         if MID_APPT_LOW <= amount <= MID_APPT_HIGH and unfiled:
             return {
                 "action": "qualified",
-                "reply_text": "Got it — I’ll send the booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
+                "reply_text": "Got it - I'll send the booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
                 "notes": "qualified_mid_with_unfiled",
                 "qualified": {"band": "mid_with_unfiled", "amount": amount, "has_unfiled_years": "yes", "state_issue": "unknown"}
             }
@@ -106,10 +106,10 @@ def _build_response(text: str, name: str):
                 "qualified": {"band": "under_secondary", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
             }
 
-        # D) Mid band without unfiled mention → nudge to booking (no “keep texting” option)
+        # D) Mid band without unfiled mention -> nudge to booking (no keep-texting option)
         return {
             "action": "reply",
-            "reply_text": "Thanks for the details — I’ll send a quick 10-minute booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
+            "reply_text": "Thanks for the details - I'll send a quick 10-minute booking link now so we can review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
             "notes": "mid_band_send_booking_link",
             "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
