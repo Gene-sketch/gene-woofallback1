@@ -4,12 +4,9 @@ from typing import Optional
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-# Read API key from env ONLY (never hardcode secrets)
 API_KEY = os.getenv("GENE_API_KEY", "dev-key")
-
-# Thresholds
-DEBT_HIGH = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))      # qualify at/above this
-SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000")) # ask unfiled years if under this
+DEBT_HIGH = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))        # qualify at/above this
+SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))   # ask missing years if under this
 
 AUTO_ESCALATE = {
     "chargeback","refund","billing","attorney","lawyer",
@@ -24,17 +21,17 @@ def has_any(text: str, keywords: set) -> bool:
 
 def parse_amount(text: str) -> Optional[int]:
     """
-    Parse amounts like: 12000, 12,000, 12k, $12k, $12,000, 8 k
+    Parse amounts like: 12000, 12,000, 12k, $12k, $12,000
     Returns integer dollars or None.
     """
     if not text:
         return None
-    t = text.lower().replace(",", "").replace(" ", "")
-    m = re.search(r'\$?(\d+)(k)?', t)
+    t = text.lower().replace(",", "").strip()
+    m = re.search(r'(\$?\d+)\s*(k)?', t)
     if not m:
         return None
-    num = int(m.group(1))
-    if m.group(2):  # has 'k'
+    num = int(m.group(1).lstrip("$"))
+    if m.group(2):  # 'k'
         num *= 1000
     return num
 
@@ -50,7 +47,7 @@ async def _parse(req: Request):
     return text, name
 
 def _build_response(text: str, name: str):
-    # 1) Auto-escalate for sensitive topics
+    # 1) auto-escalate for sensitive topics
     if has_any(text, AUTO_ESCALATE):
         return {
             "action": "escalate",
@@ -63,7 +60,7 @@ def _build_response(text: str, name: str):
             "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
 
-    # 2) If an amount is present, decide path
+    # 2) if they mention an amount, auto-decide next step
     amount = parse_amount(text)
     if amount is not None:
         if amount >= DEBT_HIGH:
@@ -71,24 +68,39 @@ def _build_response(text: str, name: str):
                 "action": "qualified",
                 "reply_text": "Great, thanks — I’ll send the booking link now.",
                 "notes": "auto_qualified_by_amount",
-                "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
+                "qualified": {
+                    "band": "over_threshold",
+                    "amount": amount,
+                    "has_unfiled_years": "unknown",
+                    "state_issue": "unknown"
+                }
             }
         if amount < SECONDARY_LOW:
             return {
                 "action": "reply",
                 "reply_text": "Thanks. Do you have any missing tax years that need to be filed? - Gene, Lexington Tax Group",
                 "notes": "followup_missing_years_under_threshold",
-                "qualified": {"band": "under_secondary", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
+                "qualified": {
+                    "band": "under_secondary",
+                    "amount": amount,
+                    "has_unfiled_years": "unknown",
+                    "state_issue": "unknown"
+                }
             }
-        # Mid band
+        # mid band
         return {
             "action": "reply",
             "reply_text": "Thanks for the details. Do you prefer I send a 10-minute booking link, or keep going by text?",
             "notes": "mid_band_next_step",
-            "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": "unknown"}
+            "qualified": {
+                "band": "mid_band",
+                "amount": amount,
+                "has_unfiled_years": "unknown",
+                "state_issue": "unknown"
+            }
         }
 
-    # 3) Default clarify (your two-question line)
+    # 3) default clarify (your combined question)
     return {
         "action": "reply",
         "reply_text": (
@@ -104,4 +116,13 @@ async def _auth(authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.post("/gene/woofallback")
-async def woofallback(req: Request, authorization:
+async def woofallback(req: Request, authorization: Optional[str] = Header(None)):
+    await _auth(authorization)
+    text, name = await _parse(req)
+    return JSONResponse(_build_response(text, name))
+
+@app.post("/gene/woofallback1")
+async def woofallback1(req: Request, authorization: Optional[str] = Header(None)):
+    await _auth(authorization)
+    text, name = await _parse(req)
+    return JSONResponse(_build_response(text, name))
