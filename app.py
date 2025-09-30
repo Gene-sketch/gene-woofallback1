@@ -1,16 +1,25 @@
 # app.py
-import os, re
-from typing import Optional
-from fastapi import FastAPI, Request, Header, HTTPException
+import os, re, json
+from typing import Optional, Tuple
+from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+import httpx
 
-# --- Tunable thresholds via env vars ---
+# --- Tunable thresholds & config via env vars ---
 API_KEY       = os.getenv("GENE_API_KEY", "dev-key")
 DEBT_HIGH     = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))   # auto-qualify at/above
-SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask missing years if under
-MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # qualify if 5-7k AND unfiled
+SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask/check unfiled when under this
+MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # 5–7k mid band
 MID_APPT_HIGH = int(os.getenv("MID_APPT_HIGH", "7000"))
 
+# Campaign name can be overridden in Render env if your label differs
+CAMPAIGN_NAME = os.getenv("CAMPAIGN_BOOKED_NAME", "1st Trade Scheduled")
+
+# Optional: auto-forward Gene's decision to Woo (or any handler)
+WOO_WEBHOOK_URL   = os.getenv("WOO_WEBHOOK_URL", "")
+WOO_WEBHOOK_TOKEN = os.getenv("WOO_WEBHOOK_TOKEN", "")
+
+# Keywords that should immediately escalate to a human
 AUTO_ESCALATE = {
     "chargeback","refund","billing","attorney","lawyer",
     "levy","lien","garnish","garnishment","lawsuit","complaint","harassment"
@@ -43,9 +52,24 @@ def detect_unfiled(text: str) -> bool:
     patterns = [
         r"\bunfiled\b",
         r"\bmissing\s+(?:tax\s+)?years?\b",
-        r"\b(?:not|haven'?t|didn'?t)\s+filed?\b",
+        r"\b(?:not|haven'?t|didn'?t)\s+file(d)?\b",
         r"\bbehind\s+on\s+filing\b",
         r"\bback\s+(?:returns?|years?)\b"
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+def detect_no_unfiled(text: str) -> bool:
+    """Detect they are up to date / no missing years."""
+    if not text:
+        return False
+    t = text.lower()
+    patterns = [
+        r"\bno\s+(?:missing\s+)?(?:tax\s+)?years?\b",
+        r"\ball\s+(?:returns?|years?)\s+filed\b",
+        r"\bup\s*to\s*date\s+on\s+filing\b",
+        r"\beverything\s+is\s+filed\b",
+        r"\ball\s+filed\b",
+        r"\bcurrent\s+on\s+filing\b"
     ]
     return any(re.search(p, t) for p in patterns)
 
@@ -65,18 +89,22 @@ def detect_state_issue(text: str) -> bool:
     ]
     return any(re.search(p, t) for p in patterns)
 
+def first_name(name: str) -> str:
+    n = (name or "").strip()
+    return n.split()[0] if n else "there"
+
 @app.get("/")
 async def health():
     return {"ok": True, "service": "gene-woofallback"}
 
-async def _parse(req: Request):
+async def _parse(req: Request) -> Tuple[dict, str, str]:
     payload = await req.json()
     lead = (payload or {}).get("lead") or {}
     name = lead.get("name") or "there"
     text = ((payload or {}).get("message") or {}).get("text", "")
-    return text, name
+    return payload, text, name
 
-def _build_response(text: str, name: str):
+def _build_response(payload: dict, text: str, name: str):
     # 1) Auto-escalate for sensitive topics
     if has_any(text, AUTO_ESCALATE):
         return {
@@ -85,7 +113,7 @@ def _build_response(text: str, name: str):
             "notes": "auto_escalate_keyword",
             "escalation": {
                 "summary": "Sensitive keyword detected (billing/legal/etc.)",
-                "suggested": f"Hi {name}, I'm looping a specialist in now. What's the best number/time today?"
+                "suggested": f"Hi {first_name(name)}, I'm looping a specialist in now. What's the best number/time today?"
             },
             "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
@@ -93,22 +121,49 @@ def _build_response(text: str, name: str):
     # 2) If they mention an amount, decide next step
     amount = parse_amount(text)
     unfiled = detect_unfiled(text)
+    no_unfiled = detect_no_unfiled(text)
     state_flag = "yes" if detect_state_issue(text) else "unknown"
+
+    # Support for Woo storing last known amount in payload.context.last_amount
+    context = (payload or {}).get("context") or {}
+    last_amount = context.get("last_amount")
+    if isinstance(last_amount, (float, int)):
+        last_amount = int(last_amount)
+
+    # --- Non-qualify self-help: under threshold AND no unfiled ---
+    amt_for_decision = amount if amount is not None else last_amount
+    if (amt_for_decision is not None) and (amt_for_decision < SECONDARY_LOW) and no_unfiled:
+        msg = (
+            f"Hi {first_name(name)}, due to the amount you owe the fees for service may outweigh the savings. "
+            "I recommend contacting the IRS directly and requesting a First-Time Penalty Abatement, then the Fresh Start "
+            "Streamlined Installment Agreement. That will usually be the smallest payment without submitting full financials "
+            "to the IRS with the best terms. Below is the IRS contact information (also on your latest notice). Thank you.\n\n"
+            "www.irs.gov\n800-829-1040"
+        )
+        return {
+            "action": "reply",
+            "reply_text": msg,
+            "notes": "disqualify_self_help",
+            "route": "irs_self_help",
+            "workflow": {
+                "crm": {"system": "Velocify", "status": "Self Help Provided"}
+            },
+            "qualified": {"band": "under_secondary", "amount": amt_for_decision, "has_unfiled_years": "no", "state_issue": state_flag}
+        }
 
     if amount is not None:
         # A) Over threshold => BOOK via Woo
         if amount >= DEBT_HIGH:
             return {
                 "action": "qualified",
-                "reply_text": "Great, thanks — we’ll get you scheduled now to review options, including IRS Fresh Start savings programs, and check any state issues if that applies.",
+                "reply_text": "Great, thanks - we will get you scheduled now to review options, including IRS Fresh Start savings programs, and check any state issues if that applies.",
                 "notes": "auto_qualified_by_amount",
                 "route": "woo_booking",
                 "handoff": {"to": "woo", "type": "appointment_request", "reason": "over_threshold"},
                 "workflow": {
                     "schedule_in_woo": True,
-                    "campaign_state": "Scheduled",
-                    "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"},
-                    "reminder_minutes_before": 15
+                    "campaign": {"name": CAMPAIGN_NAME, "action": "switch"},
+                    "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"}
                 },
                 "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": state_flag}
             }
@@ -117,20 +172,19 @@ def _build_response(text: str, name: str):
         if MID_APPT_LOW <= amount <= MID_APPT_HIGH and unfiled:
             return {
                 "action": "qualified",
-                "reply_text": "Got it — we’ll get you scheduled now to review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
+                "reply_text": "Got it - we will get you scheduled now to review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
                 "notes": "qualified_mid_with_unfiled",
                 "route": "woo_booking",
                 "handoff": {"to": "woo", "type": "appointment_request", "reason": "mid_with_unfiled"},
                 "workflow": {
                     "schedule_in_woo": True,
-                    "campaign_state": "Scheduled",
-                    "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"},
-                    "reminder_minutes_before": 15
+                    "campaign": {"name": CAMPAIGN_NAME, "action": "switch"},
+                    "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"}
                 },
                 "qualified": {"band": "mid_with_unfiled", "amount": amount, "has_unfiled_years": "yes", "state_issue": state_flag}
             }
 
-        # C) Under secondary low => ask missing years
+        # C) Under secondary low -> if we don't yet know filing status, ask about missing years
         if amount < SECONDARY_LOW:
             return {
                 "action": "reply",
@@ -142,15 +196,14 @@ def _build_response(text: str, name: str):
         # D) Mid band without unfiled mention → nudge to booking via Woo
         return {
             "action": "reply",
-            "reply_text": "Thanks for the details — we’ll get you scheduled for a quick 10-minute call to review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
+            "reply_text": "Thanks for the details - we will get you scheduled for a quick 10-minute call to review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
             "notes": "mid_band_send_booking",
             "route": "woo_booking",
             "handoff": {"to": "woo", "type": "appointment_request", "reason": "mid_band"},
             "workflow": {
                 "schedule_in_woo": True,
-                "campaign_state": "Scheduled",
-                "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"},
-                "reminder_minutes_before": 15
+                "campaign": {"name": CAMPAIGN_NAME, "action": "switch"},
+                "crm": {"system": "Velocify", "status": "AI Appointment Scheduled"}
             },
             "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": state_flag}
         }
@@ -171,14 +224,37 @@ async def _auth(authorization: Optional[str]):
     if authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+async def _post_to_woo_async(payload: dict, decision: dict) -> None:
+    """Background: forward Gene's decision to Woo (if configured)."""
+    if not WOO_WEBHOOK_URL:
+        return
+    try:
+        headers = {"Content-Type": "application/json"}
+        if WOO_WEBHOOK_TOKEN:
+            headers["Authorization"] = f"Bearer {WOO_WEBHOOK_TOKEN}"
+        body = {"source": "gene-woofallback", "decision": decision, "payload": payload}
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(WOO_WEBHOOK_URL, json=body, headers=headers)
+    except Exception:
+        # swallow errors; Gene should still reply to the lead
+        pass
+
 @app.post("/gene/woofallback")
-async def woofallback(req: Request, authorization: Optional[str] = Header(None)):
+async def woofallback(req: Request, authorization: Optional[str] = Header(None), background_tasks: BackgroundTasks = None):
     await _auth(authorization)
-    text, name = await _parse(req)
-    return JSONResponse(_build_response(text, name))
+    payload, text, name = await _parse(req)
+    decision = _build_response(payload, text, name)
+    if decision.get("route") == "woo_booking" and WOO_WEBHOOK_URL and background_tasks is not None:
+        background_tasks.add_task(_post_to_woo_async, payload, decision)
+        decision["forward_queued"] = True
+    return JSONResponse(decision)
 
 @app.post("/gene/woofallback1")
-async def woofallback1(req: Request, authorization: Optional[str] = Header(None)):
+async def woofallback1(req: Request, authorization: Optional[str] = Header(None), background_tasks: BackgroundTasks = None):
     await _auth(authorization)
-    text, name = await _parse(req)
-    return JSONResponse(_build_response(text, name))
+    payload, text, name = await _parse(req)
+    decision = _build_response(payload, text, name)
+    if decision.get("route") == "woo_booking" and WOO_WEBHOOK_URL and background_tasks is not None:
+        background_tasks.add_task(_post_to_woo_async, payload, decision)
+        decision["forward_queued"] = True
+    return JSONResponse(decision)
