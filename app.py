@@ -1,32 +1,46 @@
 # app.py
-import os, re, json
+import os
+import re
 from typing import Optional, Tuple
+
 from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-import httpx
 
-# --- Tunable thresholds & config via env vars ---
+# httpx is optional; used only if you set WOO_WEBHOOK_URL
+try:
+    import httpx  # type: ignore
+except Exception:  # pragma: no cover
+    httpx = None  # fallback if not installed
+
+# ----------------------------
+# Config via environment vars
+# ----------------------------
+SERVICE_NAME  = os.getenv("SERVICE_NAME", "gene-woofallback")
 API_KEY       = os.getenv("GENE_API_KEY", "dev-key")
-DEBT_HIGH     = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))   # auto-qualify at/above
+
+DEBT_HIGH     = int(os.getenv("PRIMARY_DEBT_HIGH", "8000"))   # auto-qualify at/above this
 SECONDARY_LOW = int(os.getenv("SECONDARY_DEBT_LOW", "6000"))  # ask/check unfiled when under this
 MID_APPT_LOW  = int(os.getenv("MID_APPT_LOW", "5000"))        # 5–7k mid band
 MID_APPT_HIGH = int(os.getenv("MID_APPT_HIGH", "7000"))
 
-# Campaign name can be overridden in Render env if your label differs
+# Campaign label Woo should switch to when appointment is booked
 CAMPAIGN_NAME = os.getenv("CAMPAIGN_BOOKED_NAME", "1st Trade Scheduled")
 
-# Optional: auto-forward Gene's decision to Woo (or any handler)
+# Optional: Gene can also POST the decision to a Woo webhook you control
 WOO_WEBHOOK_URL   = os.getenv("WOO_WEBHOOK_URL", "")
 WOO_WEBHOOK_TOKEN = os.getenv("WOO_WEBHOOK_TOKEN", "")
 
 # Keywords that should immediately escalate to a human
 AUTO_ESCALATE = {
-    "chargeback","refund","billing","attorney","lawyer",
-    "levy","lien","garnish","garnishment","lawsuit","complaint","harassment"
+    "chargeback", "refund", "billing", "attorney", "lawyer",
+    "levy", "lien", "garnish", "garnishment", "lawsuit", "complaint", "harassment"
 }
 
 app = FastAPI(title="Gene Woo Fallback")
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def has_any(text: str, keywords: set) -> bool:
     t = (text or "").lower()
     return any(k in t for k in keywords)
@@ -54,7 +68,7 @@ def detect_unfiled(text: str) -> bool:
         r"\bmissing\s+(?:tax\s+)?years?\b",
         r"\b(?:not|haven'?t|didn'?t)\s+file(d)?\b",
         r"\bbehind\s+on\s+filing\b",
-        r"\bback\s+(?:returns?|years?)\b"
+        r"\bback\s+(?:returns?|years?)\b",
     ]
     return any(re.search(p, t) for p in patterns)
 
@@ -69,7 +83,7 @@ def detect_no_unfiled(text: str) -> bool:
         r"\bup\s*to\s*date\s+on\s+filing\b",
         r"\beverything\s+is\s+filed\b",
         r"\ball\s+filed\b",
-        r"\bcurrent\s+on\s+filing\b"
+        r"\bcurrent\s+on\s+filing\b",
     ]
     return any(re.search(p, t) for p in patterns)
 
@@ -85,7 +99,7 @@ def detect_state_issue(text: str) -> bool:
         r"\bfranchise\s+tax\s+board\b",
         r"\bftb\b",
         r"\bedd\b",
-        r"\bdtf\b"
+        r"\bdtf\b",
     ]
     return any(re.search(p, t) for p in patterns)
 
@@ -93,9 +107,12 @@ def first_name(name: str) -> str:
     n = (name or "").strip()
     return n.split()[0] if n else "there"
 
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/")
 async def health():
-    return {"ok": True, "service": "gene-woofallback"}
+    return {"ok": True, "service": SERVICE_NAME}
 
 async def _parse(req: Request) -> Tuple[dict, str, str]:
     payload = await req.json()
@@ -118,19 +135,19 @@ def _build_response(payload: dict, text: str, name: str):
             "qualified": {"band": "unknown", "has_unfiled_years": "unknown", "state_issue": "unknown"}
         }
 
-    # 2) If they mention an amount, decide next step
+    # 2) Extract signals
     amount = parse_amount(text)
     unfiled = detect_unfiled(text)
     no_unfiled = detect_no_unfiled(text)
     state_flag = "yes" if detect_state_issue(text) else "unknown"
 
-    # Support for Woo storing last known amount in payload.context.last_amount
+    # Woo can pass last known amount back to us on the next call
     context = (payload or {}).get("context") or {}
     last_amount = context.get("last_amount")
     if isinstance(last_amount, (float, int)):
         last_amount = int(last_amount)
 
-    # --- Non-qualify self-help: under threshold AND no unfiled ---
+    # 3) Non-qualify self-help: under threshold AND no unfiled
     amt_for_decision = amount if amount is not None else last_amount
     if (amt_for_decision is not None) and (amt_for_decision < SECONDARY_LOW) and no_unfiled:
         msg = (
@@ -151,8 +168,9 @@ def _build_response(payload: dict, text: str, name: str):
             "qualified": {"band": "under_secondary", "amount": amt_for_decision, "has_unfiled_years": "no", "state_issue": state_flag}
         }
 
+    # 4) Amount-aware paths
     if amount is not None:
-        # A) Over threshold => BOOK via Woo
+        # A) Over threshold => Book via Woo
         if amount >= DEBT_HIGH:
             return {
                 "action": "qualified",
@@ -168,7 +186,7 @@ def _build_response(payload: dict, text: str, name: str):
                 "qualified": {"band": "over_threshold", "amount": amount, "has_unfiled_years": "unknown", "state_issue": state_flag}
             }
 
-        # B) 5–7k AND unfiled => BOOK via Woo
+        # B) 5–7k AND unfiled => Book via Woo
         if MID_APPT_LOW <= amount <= MID_APPT_HIGH and unfiled:
             return {
                 "action": "qualified",
@@ -184,7 +202,7 @@ def _build_response(payload: dict, text: str, name: str):
                 "qualified": {"band": "mid_with_unfiled", "amount": amount, "has_unfiled_years": "yes", "state_issue": state_flag}
             }
 
-        # C) Under secondary low -> if we don't yet know filing status, ask about missing years
+        # C) Under secondary low -> if filing status unknown, ask about missing years
         if amount < SECONDARY_LOW:
             return {
                 "action": "reply",
@@ -193,7 +211,7 @@ def _build_response(payload: dict, text: str, name: str):
                 "qualified": {"band": "under_secondary", "amount": amount, "has_unfiled_years": "unknown", "state_issue": state_flag}
             }
 
-        # D) Mid band without unfiled mention → nudge to booking via Woo
+        # D) Mid band without unfiled mention -> nudge to booking via Woo
         return {
             "action": "reply",
             "reply_text": "Thanks for the details - we will get you scheduled for a quick 10-minute call to review options, including IRS Fresh Start savings programs, and any state issues if that applies.",
@@ -208,7 +226,7 @@ def _build_response(payload: dict, text: str, name: str):
             "qualified": {"band": "mid_band", "amount": amount, "has_unfiled_years": "unknown", "state_issue": state_flag}
         }
 
-    # 3) Default clarify (combined question + value prop)
+    # 5) Default clarify (combined question + value prop)
     return {
         "action": "reply",
         "reply_text": (
@@ -226,7 +244,7 @@ async def _auth(authorization: Optional[str]):
 
 async def _post_to_woo_async(payload: dict, decision: dict) -> None:
     """Background: forward Gene's decision to Woo (if configured)."""
-    if not WOO_WEBHOOK_URL:
+    if not WOO_WEBHOOK_URL or httpx is None:
         return
     try:
         headers = {"Content-Type": "application/json"}
